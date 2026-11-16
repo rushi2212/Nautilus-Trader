@@ -41,9 +41,9 @@ The runner connects a Nautilus `LiveNode` to the Bybit OPTION data and execution
 
 1. Nautilus builds the Bybit data and execution clients. On startup, the live node connects and reconciles open orders and positions before strategy startup.
 2. The strategy reads cached BTC option instruments, chooses the nearest future expiry with a shared call/put strike, and subscribes to that option chain. It uses the chain's Bybit ATM reference and selects the nearest strike where both legs have quotes.
-3. It subscribes to both leg quotes and sends one market SELL IOC order per leg. Nautilus delivers acknowledgements, fills, cancellations, rejections, and position state through the strategy callbacks and cache.
+3. It subscribes to both leg quotes and sends one market SELL IOC order per leg once the Nautilus cache has fresh quotes for both instruments. Nautilus delivers acknowledgements, fills, cancellations, rejections, and position state through the strategy callbacks and cache; the strategy does not maintain a duplicate quote store.
 4. It begins Level 2 risk monitoring after both legs are fully filled. Entry premium is based on each filled order's average fill price and filled quantity. Buyback value uses each leg's current ask and the corresponding position quantity.
-5. A combined buyback value at least 1% above entry triggers a stop; a value at least 2% below entry triggers the target. Bybit options do not provide the required combined-premium OCO order, so the strategy monitors quotes and uses Nautilus `market_exit()` to cancel working orders and close strategy positions. If entry is partial or a leg fails, it uses that same exit workflow to flatten any exposure and does not re-enter.
+5. A combined buyback value at least 1% above entry triggers a stop; a value at least 2% below entry triggers the target. Bybit options do not provide the required combined-premium OCO order, so the strategy monitors quotes and uses Nautilus `market_exit()` to cancel working orders and close strategy positions. If entry is partial or a leg fails, it uses that same exit workflow to flatten any exposure and does not re-enter. A 30-second strategy deadline handles a missing/incomplete two-leg entry event sequence; it complements the adapter's request timeouts and startup reconciliation rather than duplicating order or position management.
 
 ### Stop and restart behavior
 
@@ -73,5 +73,6 @@ The included Docker/Render deployment serves the dashboard and FastAPI only. It 
 ## Official references
 
 - [NautilusTrader Bybit integration](https://nautilustrader.io/docs/latest/integrations/bybit/)
+- [Official Bybit option-chain example](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/live/bybit/bybit_option_chain.py)
 - [NautilusTrader strategy lifecycle](https://nautilustrader.io/docs/latest/concepts/strategies/)
 - [NautilusTrader live configuration and persistence](https://nautilustrader.io/docs/latest/how_to/configure_live_trading/)

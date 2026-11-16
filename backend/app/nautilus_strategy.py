@@ -13,8 +13,6 @@ import json
 from collections import defaultdict
 from typing import Any
 
-from nautilus_trader.adapters.bybit import BybitEnvironment, BybitProductType
-
 from nautilus_trader.model import (
     ClientId,
     CryptoOption,
@@ -71,7 +69,7 @@ class BtcAtmShortStraddle(Strategy):
         self.stop_loss_fraction = config.stop_loss_fraction
         self.take_profit_fraction = config.take_profit_fraction
 
-        self._phase = "STARTING"
+        self._phase = "IDLE"
         self._traded = False
         self._series_id: OptionSeriesId | None = None
         self._call_id: InstrumentId | None = None
@@ -80,7 +78,6 @@ class BtcAtmShortStraddle(Strategy):
         self._put_qty = 0.0
         self._entry_order_ids: list[Any] = []
         self._entry_premium: float | None = None
-        self._asks: dict[InstrumentId, tuple[float, int]] = {}
         self._loaded_pair: tuple[str, str] | None = None
 
     def on_load(self, state: dict[str, bytes]) -> None:
@@ -280,51 +277,55 @@ class BtcAtmShortStraddle(Strategy):
             f"Selected ATM pair strike={strike} expiry={self._series_id}; "
             f"call={self._call_id}, put={self._put_id}, qty={self._call_qty} per leg",
         )
-        self._update_quote(call_quote)
-        self._update_quote(put_quote)
+        # Quote subscription updates the Nautilus cache before on_quote runs.
+        # Try the cache now in case the chain snapshot already populated it;
+        # otherwise the next quote callback will retry entry.
         self._maybe_submit_entry()
 
     def on_quote(self, tick: QuoteTick) -> None:
         if tick.instrument_id not in (self._call_id, self._put_id):
             return
-        self._update_quote(tick)
         if self._phase == "WAITING_QUOTES":
             self._maybe_submit_entry()
             return
         if self._phase != "MANAGING" or self._entry_premium is None:
             return
 
-        now_ns = self.clock.timestamp_ns()
-        call = self._asks.get(self._call_id)
-        put = self._asks.get(self._put_id)
-        if not call or not put:
+        quotes = self._fresh_pair_quotes()
+        if quotes is None:
             return
-        if now_ns - call[1] > MAX_QUOTE_AGE_NS or now_ns - put[1] > MAX_QUOTE_AGE_NS:
+        call_quote, put_quote = quotes
+        if call_quote.ask_price.as_double() <= 0 or put_quote.ask_price.as_double() <= 0:
             return
-        if call[0] <= 0 or put[0] <= 0:
-            return
-
-        buyback = call[0] * self._call_qty + put[0] * self._put_qty
+        buyback = (
+            call_quote.ask_price.as_double() * self._call_qty
+            + put_quote.ask_price.as_double() * self._put_qty
+        )
         if buyback >= self._entry_premium * (1 + self.stop_loss_fraction):
             self._begin_exit(f"stop loss: buyback {buyback:.8f} >= entry × 1.01")
         elif buyback <= self._entry_premium * (1 - self.take_profit_fraction):
             self._begin_exit(f"take profit: buyback {buyback:.8f} <= entry × 0.98")
 
-    def _update_quote(self, tick: QuoteTick) -> None:
-        self._asks[tick.instrument_id] = (tick.ask_price.as_double(), tick.ts_event)
+    def _fresh_pair_quotes(self) -> tuple[QuoteTick, QuoteTick] | None:
+        if self._call_id is None or self._put_id is None:
+            return None
+        call_quote = self.cache.quote(self._call_id)
+        put_quote = self.cache.quote(self._put_id)
+        if call_quote is None or put_quote is None:
+            return None
+        now_ns = self.clock.timestamp_ns()
+        if now_ns - call_quote.ts_event > MAX_QUOTE_AGE_NS:
+            return None
+        if now_ns - put_quote.ts_event > MAX_QUOTE_AGE_NS:
+            return None
+        return call_quote, put_quote
 
     def _maybe_submit_entry(self) -> None:
         if self._phase != "WAITING_QUOTES" or not self._call_id or not self._put_id:
             return
-        call = self._asks.get(self._call_id)
-        put = self._asks.get(self._put_id)
-        if not call or not put:
+        if self._fresh_pair_quotes() is None:
             return
         now_ns = self.clock.timestamp_ns()
-        if now_ns - call[1] > MAX_QUOTE_AGE_NS or now_ns - put[1] > MAX_QUOTE_AGE_NS:
-            return
-        if call[0] <= 0 or put[0] <= 0:
-            return
 
         call_order = self.order_factory.market(
             self._call_id,
@@ -407,7 +408,7 @@ class BtcAtmShortStraddle(Strategy):
             self._begin_exit("Entry timeout: flattening any partial exposure")
 
     def _begin_exit(self, reason: str) -> None:
-        if self._phase in {"EXITING", "DONE", "BLOCKED"} or self.is_exiting():
+        if self._phase in {"EXITING", "DONE"} or self.is_exiting():
             return
         self._phase = "EXITING"
         self.log.warning(f"Starting Nautilus market exit: {reason}")
